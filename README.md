@@ -501,7 +501,7 @@ git branch -M $(git remote show origin | grep "HEAD branch" | cut -d " " -f5) 2>
 > **关于私有仓库的特别提醒**
 > 
 > 如果你将仓库设置为 **Private（私有）**，则通过 Raw 链接访问 `ip.txt` 时必须在 URL 后附加 `?token=你的令牌` 参数才能获取内容，例如：
-> ```
+> ```text
 > https://raw.githubusercontent.com/用户名/仓库名/refs/heads/分支名/ip.txt?token=xxxxxx
 > ```
 > 但请注意，**部分代理工具或订阅解析器可能无法正确处理带 Token 参数的 URL**，原因包括：
@@ -512,7 +512,7 @@ git branch -M $(git remote show origin | grep "HEAD branch" | cut -d " " -f5) 2>
 > **因此，如果你希望将 `ip.txt` 作为订阅链接供代理工具使用，强烈建议将仓库设为 Public（公开）。**
 > 
 > 公开仓库的 Raw 链接无需 Token 即可访问，兼容性最佳：
-> ```
+> ```text
 > https://raw.githubusercontent.com/用户名/仓库名/refs/heads/分支名/ip.txt
 > ```
 
@@ -531,7 +531,7 @@ git branch -M $(git remote show origin | grep "HEAD branch" | cut -d " " -f5) 2>
 ### 方法一：优选订阅模式（推荐）
 
 1. 复制你的 GitHub Raw 链接：
-   ```
+   ```text
    https://raw.githubusercontent.com/你的用户名/仓库名/refs/heads/分支名/ip.txt
    ```
 2. 打开 EdgeTunnel 控制面板，点击菜单栏的 **“优选订阅生成”**。
@@ -548,7 +548,7 @@ git branch -M $(git remote show origin | grep "HEAD branch" | cut -d " " -f5) 2>
 1. 打开 EdgeTunnel 控制面板，点击菜单栏的 **“优选订阅生成”**。
 2. 在 **“优选订阅模式”** 区域，选择 **“自定义订阅（支持汇聚订阅）”**。
 3. 在 **“自定义订阅地址”** 输入框中直接粘贴节点地址，每行一个，例如：
-   ```
+   ```text
    104.16.x.x:443#US
    162.159.x.x:443#HK
    ```
