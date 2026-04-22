@@ -312,7 +312,7 @@ python3 main.py
 | `AVAILABILITY_RETRY_MAX` | `int` | `2` | 可用性检测最大重试轮数 |
 | `AVAILABILITY_RETRY_DELAY` | `int` | `5` | 可用性检测重试间隔（秒） |
 | `AVAILABILITY_PROBES` | `int` | `3` | 每个节点可用性检测的 API 请求次数，取最小延迟对应的协议栈结果 |
-| `AVAILABILITY_MAX_DELAY_THRESHOLD` | `int` | `0` | **仅作用于 DNS**：出站延迟阈值（毫秒），高于此值的节点不写入 DNS（0 表示不启用） |
+| `AVAILABILITY_MAX_DELAY_THRESHOLD` | `int` | `10` | **仅作用于 DNS**：出站延迟阈值（毫秒），高于此值的节点不写入 DNS（0 表示不启用） |
 | `FILTER_IPV6_AVAILABILITY` | `boolean` | `true` | **仅作用于 DNS**：是否过滤落地仅 IPv6 的节点（`ipv6_only`） |
 
 > 💡 IPv6 过滤逻辑：通过 API 返回的 `inferred_stack` 判断，仅淘汰 `ipv6_only` 节点，保留 `ipv4_only` 和 `dual_stack` 节点。
