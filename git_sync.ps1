@@ -7,13 +7,13 @@
 
 # ==================== GitHub 认证信息（请修改为你的信息） ====================
 # 个人访问令牌（Personal Access Token），用于身份验证
-$github_token = "your_github_personal_access_token_here"
+$github_token = "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"
 # GitHub 用户名
-$github_username = "your_github_username"
+$github_username = "actionzheng"
 # 仓库名称
-$repo_name = "your_repo_name"
+$repo_name = "cfnb"
 # 目标分支
-$branch = "your_branch"
+$branch = "main"
 
 # ==================== 切换到脚本所在目录 ====================
 Set-Location $PSScriptRoot
