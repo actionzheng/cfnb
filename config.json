@@ -7,7 +7,7 @@
     "GLOBAL_TOP_N": 60,
     "_comment_GLOBAL_TOP_N": "全局模式下最终保留的节点数量",
 
-    "PER_COUNTRY_TOP_N": 10,
+    "PER_COUNTRY_TOP_N": 50,
     "_comment_PER_COUNTRY_TOP_N": "分国家模式下每个国家保留的节点数量",
 
     "BANDWIDTH_CANDIDATES": 300,
