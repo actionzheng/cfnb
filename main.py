@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
 Cloudflare IP 优选工具 (TCP筛选 + IP可用性二次筛选 + HTTP检测 + curl带宽测速 + WxPusher通知)
-依赖：requests, curl (系统自带)
-配置文件：同目录下的 config.json（请根据需要修改参数）
+依赖：requests, curl, aiohttp
+配置文件：同目录下的 config.json
 结果保存到 ip.txt，并自动推送到 GitHub，同时批量更新到 Cloudflare DNS
 支持 Windows / Linux
 优化：国家过滤前置，减少无效 TCP 测试；重试参数可配置；所有网络请求连接超时分离
+新增：IP 地区校准 + 缓存差异化更新
+修复：asyncio.TimeoutError 导致崩溃；事件循环残留警告；增加进度提示；实时写入缓存文件
+新增：缓存文件按 IP 地址自动排序
+修复：节点标签只保留国家代码；token耗尽通知只在真正耗尽时发送
 """
 
 import requests
@@ -17,9 +21,16 @@ import os
 import subprocess
 import shutil
 import json
+import asyncio
+import aiohttp
+import ipaddress
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib3.exceptions import InsecureRequestWarning
+
+# 修复 Windows 下 ProactorEventLoop 残留任务报警
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # 禁用 SSL 警告 (用于 HTTP 检测)
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
@@ -171,7 +182,7 @@ def load_config():
         "BANDWIDTH_CANDIDATES": 150,
         "TCP_PROBES": 1,
         "MIN_SUCCESS_RATE": 1.0,
-        "TCP_LATENCY_WEIGHT": 1.0,
+        "TCP_LATENCY_WEIGHT": 0.0,
         "TIMEOUT": 2.0,
         "SOCKET_DEFAULT_TIMEOUT": 3,
         "PROGRESS_PRINT_INTERVAL": 1,
@@ -201,6 +212,11 @@ def load_config():
         "FETCH_RETRY_DELAY": 3,
         "FETCH_TIMEOUT": 3,
         "FETCH_CONNECT_TIMEOUT": 3,
+        "IP_CALIBRATION_ENABLED": False,
+        "IP_CALIBRATION_CONCURRENCY": 300,
+        "IP_CALIBRATION_MIN_INTERVAL": 0.1,
+        "IP_CALIBRATION_TOKEN_FILE": "valid_tokens.txt",
+        "IP_CALIBRATION_CACHE_FILE": "ipinfo_cache.txt",
         "OUTPUT_FILE": "ip.txt",
         "ENABLE_LOGGING": False,
         "LOG_FILE": "cfnb.log",
@@ -223,8 +239,8 @@ def load_config():
         "HTTP_TEST_MAX_RETRIES": 2,
         "HTTP_TEST_RETRY_DELAY": 3,
         "HTTP_TEST_METHOD": "HEAD",
-        "HTTP_LATENCY_WEIGHT": 1.0,
-        "JITTER_WEIGHT": 1.0,
+        "HTTP_LATENCY_WEIGHT": 3.0,
+        "JITTER_WEIGHT": 3.0,
         "HTTP_JITTER_SAMPLES": 3,
         "FILTER_IPV6_AVAILABILITY": True,
         "FILTER_BLOCKED_COUNTRIES_ENABLED": True,
@@ -243,7 +259,7 @@ def load_config():
         "BANDWIDTH_URL_TEMPLATE": "https://speed.cloudflare.com/__down?bytes={bytes}",
         "BANDWIDTH_PROCESS_BUFFER": 2,
         "BANDWIDTH_CONNECT_TIMEOUT": 3,
-        "SPEED_WEIGHT": 1.0,
+        "SPEED_WEIGHT": 3.0,
         "MAX_WORKERS": 300,
         "AVAILABILITY_WORKERS": 32,
         "FALLBACK_WORKERS": 32,
@@ -321,6 +337,11 @@ FETCH_MAX_RETRIES = cfg["FETCH_MAX_RETRIES"]
 FETCH_RETRY_DELAY = cfg["FETCH_RETRY_DELAY"]
 FETCH_TIMEOUT = cfg["FETCH_TIMEOUT"]
 FETCH_CONNECT_TIMEOUT = cfg["FETCH_CONNECT_TIMEOUT"]
+IP_CALIBRATION_ENABLED = cfg["IP_CALIBRATION_ENABLED"]
+IP_CALIBRATION_CONCURRENCY = cfg["IP_CALIBRATION_CONCURRENCY"]
+IP_CALIBRATION_MIN_INTERVAL = cfg["IP_CALIBRATION_MIN_INTERVAL"]
+IP_CALIBRATION_TOKEN_FILE = cfg["IP_CALIBRATION_TOKEN_FILE"]
+IP_CALIBRATION_CACHE_FILE = cfg["IP_CALIBRATION_CACHE_FILE"]
 OUTPUT_FILE = cfg["OUTPUT_FILE"]
 ENABLE_LOGGING = cfg["ENABLE_LOGGING"]
 LOG_FILE = cfg["LOG_FILE"]
@@ -588,7 +609,6 @@ def _parse_text_nodes(text):
 
     tokens = text.split()
     for token in tokens:
-        # 尝试匹配纯 IP:端口 格式（不带 #）
         pure_match = re.match(r'^(\d+\.\d+\.\d+\.\d+:\d+)$', token)
         if pure_match:
             pending.append(pure_match.group(1))
@@ -661,6 +681,288 @@ def fetch_additional_source(url):
                 print(f"已尝试 {FETCH_MAX_RETRIES} 次，放弃该数据源。")
                 return []
 
+# =========================== IP 地区校准模块 ===========================
+class IpInfoAsync:
+    def __init__(self, token_list, concurrency=10, min_interval=0.1, trust_env=True):
+        self.token_list = token_list
+        self.current_token_index = 0
+        self.exhausted = False
+        self.token_lock = asyncio.Lock()
+        self.semaphore = asyncio.Semaphore(concurrency)
+        self.min_interval = min_interval
+        self.last_request_time = 0
+        self.rate_lock = asyncio.Lock()
+        self.session = None
+        self.trust_env = trust_env
+
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession(trust_env=self.trust_env)
+        return self
+
+    async def __aexit__(self, *args):
+        await self.session.close()
+
+    @property
+    def current_token(self):
+        if self.exhausted:
+            return None
+        return self.token_list[self.current_token_index]
+
+    async def switch_token(self):
+        async with self.token_lock:
+            if self.exhausted:
+                return False
+            if self.current_token_index + 1 < len(self.token_list):
+                self.current_token_index += 1
+                print(f"\n切换至第 {self.current_token_index + 1} 个 token")
+                return True
+            else:
+                self.exhausted = True
+                print("\n所有 token 均已触发 429 速率限制，无可用 token！后续 IP 将直接标记为 Unknown。")
+                return False
+
+    async def _rate_limit(self):
+        async with self.rate_lock:
+            now = asyncio.get_event_loop().time()
+            wait = self.last_request_time + self.min_interval - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self.last_request_time = asyncio.get_event_loop().time()
+
+    async def get_ip_details(self, ip_address):
+        while True:
+            token = self.current_token
+            if token is None:
+                return None
+
+            url = f"https://ipinfo.io/{ip_address}/json?token={token}"
+            await self._rate_limit()
+            async with self.semaphore:
+                try:
+                    async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        if resp.status == 429:
+                            if await self.switch_token():
+                                continue
+                            else:
+                                return None
+                        resp.raise_for_status()
+                        data = await resp.json()
+                        city = data.get("city", "Unknown")
+                        country = data.get("country", "Unknown")
+                        region = data.get("region", "Unknown")
+                        org = data.get("org", "")
+                        asn = "Unknown"
+                        isp = "Unknown"
+                        if org:
+                            parts = org.split(" ", 1)
+                            if len(parts) == 2 and parts[0].startswith("AS"):
+                                asn = parts[0]
+                                isp = parts[1]
+                            else:
+                                isp = org
+                        return {
+                            "CountryCode": country,
+                            "Region": region,
+                            "City": city,
+                            "ASN": asn,
+                            "ISP": isp,
+                        }
+                except asyncio.TimeoutError:
+                    return None
+                except aiohttp.ClientError as e:
+                    print(f"\n请求 IP {ip_address} 失败: {e}，2秒后重试...")
+                    await asyncio.sleep(2)
+
+def load_tokens(filepath):
+    if not os.path.exists(filepath):
+        return []
+    with open(filepath, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+def load_ipinfo_cache(cache_file):
+    if not os.path.exists(cache_file):
+        return {}
+    cache = {}
+    with open(cache_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or '#' not in line:
+                continue
+            ipport, tag = line.split('#', 1)
+            cache[ipport.strip()] = tag.strip()
+    return cache
+
+def save_ipinfo_cache(cache_file, new_records):
+    with open(cache_file, "a", encoding="utf-8") as f:
+        for ipport, tag in new_records:
+            f.write(f"{ipport}#{tag}\n")
+
+def sort_cache_file(cache_file):
+    if not os.path.exists(cache_file):
+        return
+    with open(cache_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    parsed = []
+    for line in lines:
+        line = line.strip()
+        if not line or '#' not in line:
+            continue
+        ipport, tag = line.split('#', 1)
+        ip_str = ipport.split(':')[0]
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        parsed.append((ip_obj, line))
+
+    parsed.sort(key=lambda x: x[0])
+
+    with open(cache_file, "w", encoding="utf-8") as f:
+        for _, line in parsed:
+            f.write(line + "\n")
+
+async def validate_tokens(token_list, concurrency, min_interval, trust_env):
+    valid = []
+    async with IpInfoAsync(token_list, concurrency, min_interval, trust_env) as handler:
+        tasks = [asyncio.ensure_future(handler.get_ip_details("1.1.1.1")) for _ in token_list]
+        total = len(tasks)
+        completed = 0
+        for coro in asyncio.as_completed(tasks):
+            await coro
+            completed += 1
+            print(f"\rToken 校验进度：{completed}/{total}", end="", flush=True)
+        print()
+        for i, task in enumerate(tasks):
+            try:
+                res = task.result()
+                if res and res.get("CountryCode") != "Unknown":
+                    valid.append(token_list[i])
+            except:
+                pass
+    return valid
+
+async def query_new_ips(new_ips, token_list, concurrency, min_interval, trust_env,
+                        ipport_map=None, cache_file=None):
+    result = {}
+    exhausted_flag = False
+    if not new_ips or not token_list:
+        return result, exhausted_flag
+
+    print(f"需要查询 {len(new_ips)} 个新 IP...")
+    async with IpInfoAsync(token_list, concurrency, min_interval, trust_env) as handler:
+        tasks = []
+        for ip in new_ips:
+            task = asyncio.ensure_future(handler.get_ip_details(ip))
+            task.my_ip = ip
+            tasks.append(task)
+        total = len(tasks)
+        completed = 0
+
+        f = None
+        if cache_file:
+            f = open(cache_file, "a", encoding="utf-8")
+
+        try:
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    ip = task.my_ip
+                    try:
+                        info = task.result()
+                    except Exception:
+                        info = None
+                    completed += 1
+                    print(f"\r[{completed}/{total}] 地区校准...", end="", flush=True)
+
+                    if info and info.get("CountryCode") != "Unknown":
+                        tag_parts = [info["CountryCode"]]
+                        if info.get("City") and info["City"] != "Unknown":
+                            tag_parts.append(info["City"])
+                        if info.get("ISP") and info["ISP"] != "Unknown":
+                            tag_parts.append(info["ISP"])
+                        tag = " ".join(tag_parts)
+                        result[ip] = tag
+
+                        if f and ipport_map and ip in ipport_map:
+                            for ipport in ipport_map[ip]:
+                                f.write(f"{ipport}#{tag}\n")
+                                f.flush()
+        finally:
+            if f:
+                f.close()
+        exhausted_flag = handler.exhausted
+    print()
+    return result, exhausted_flag
+
+def calibrate_regions(nodes, token_file, cache_file):
+    if not IP_CALIBRATION_ENABLED:
+        print("IP 地区校准已禁用，跳过。")
+        return
+
+    token_list = load_tokens(token_file)
+    if not token_list:
+        print("valid_tokens.txt 为空，IP 地区校准跳过。")
+        return
+
+    trust_env = not FORCE_DIRECT
+
+    print("正在进行 token 有效性校验...")
+    valid_tokens = asyncio.run(validate_tokens(token_list, IP_CALIBRATION_CONCURRENCY, IP_CALIBRATION_MIN_INTERVAL, trust_env))
+    if not valid_tokens:
+        print("所有 token 均已失效，地区校准跳过。")
+        send_wxpusher_notification("IP地区校准：所有token均已失效，本次校准跳过。", "IP校准 Token 耗尽")
+        return
+    print(f"有效 token 数量: {len(valid_tokens)}")
+
+    ipport_set = set()
+    for node in nodes:
+        ipport = node.split('#')[0]
+        ipport_set.add(ipport)
+
+    cache = load_ipinfo_cache(cache_file)
+    cached_ipports = set(cache.keys())
+    new_ipports = ipport_set - cached_ipports
+
+    if not new_ipports:
+        print("所有 IP 已在缓存中，无需查询。")
+    else:
+        new_ips_set = set()
+        ip_to_ipports = defaultdict(list)
+        for ipport in new_ipports:
+            ip = ipport.split(':')[0]
+            new_ips_set.add(ip)
+            ip_to_ipports[ip].append(ipport)
+
+        print(f"检测到 {len(new_ipports)} 个新 IP:端口，涉及 {len(new_ips_set)} 个唯一 IP，开始查询...")
+        ip_info, token_exhausted = asyncio.run(query_new_ips(
+            list(new_ips_set),
+            valid_tokens,
+            IP_CALIBRATION_CONCURRENCY,
+            IP_CALIBRATION_MIN_INTERVAL,
+            trust_env,
+            ipport_map=ip_to_ipports,
+            cache_file=cache_file
+        ))
+
+        for ip, tag in ip_info.items():
+            for ipport in ip_to_ipports.get(ip, []):
+                cache[ipport] = tag
+
+        fail_count = len(new_ipports) - sum(1 for ip in ip_info for _ in ip_to_ipports.get(ip, []))
+        if token_exhausted:
+            send_wxpusher_notification(f"IP地区校准：token已全部触发速率限制，{fail_count} 个新IP未能校准。", "IP校准 Token 耗尽")
+
+    for i, node in enumerate(nodes):
+        ipport = node.split('#')[0]
+        tag = cache.get(ipport)
+        if tag:
+            country_code = tag.split()[0]  # 只保留国家代码
+            nodes[i] = f"{ipport}#{country_code}"
+
+    sort_cache_file(cache_file)
+
 # =========================== 核心测试、筛选、测速及更新函数 ===========================
 
 def test_tcp_latency(ip, port, timeout=TIMEOUT, probes=TCP_PROBES):
@@ -686,10 +988,8 @@ def test_node(node_str):
         return None
     ip, port, country = m.groups()
     min_lat, success = test_tcp_latency(ip, port)
-
     if success == 0 or (success / TCP_PROBES) < MIN_SUCCESS_RATE:
         return None
-
     return (node_str, min_lat, country, success)
 
 def check_availability(node_str):
@@ -703,12 +1003,8 @@ def check_availability(node_str):
     best_exit_info = {}
     success = False
 
-    if AVAILABILITY_INNER_RETRY_ENABLED:
-        max_attempts = AVAILABILITY_INNER_RETRY_MAX + 1
-        retry_delay = AVAILABILITY_INNER_RETRY_DELAY
-    else:
-        max_attempts = 1
-        retry_delay = 0
+    max_attempts = AVAILABILITY_INNER_RETRY_MAX + 1 if AVAILABILITY_INNER_RETRY_ENABLED else 1
+    retry_delay = AVAILABILITY_INNER_RETRY_DELAY if AVAILABILITY_INNER_RETRY_ENABLED else 0
 
     for attempt in range(max_attempts):
         try:
@@ -742,14 +1038,11 @@ def check_http_server(node_str, timeout, max_retries, retry_delay, method, conne
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
     }
 
-    # 从配置读取抖动测试次数，至少 3 次
     test_rounds = max(3, HTTP_JITTER_SAMPLES)
     latencies = []
     for _ in range(test_rounds):
         try:
             start = time.time()
-            
-            # 根据 FORCE_DIRECT 动态设置代理
             request_kwargs = {
                 "timeout": (connect_timeout, timeout),
                 "verify": False,
@@ -763,7 +1056,7 @@ def check_http_server(node_str, timeout, max_retries, retry_delay, method, conne
                 resp = requests.head(url, **request_kwargs)
             else:
                 resp = requests.get(url, **request_kwargs)
-                
+
             lat = (time.time() - start) * 1000
             if resp.status_code != 400:
                 return (node_str, False, f"status_{resp.status_code}", 0.0, 0.0)
@@ -779,8 +1072,7 @@ def check_http_server(node_str, timeout, max_retries, retry_delay, method, conne
 
     avg_lat = sum(latencies) / len(latencies)
     variance = sum((l - avg_lat) ** 2 for l in latencies) / len(latencies)
-    jitter = variance ** 0.5  # 标准差，单位毫秒
-
+    jitter = variance ** 0.5
     return (node_str, True, "cloudflare", avg_lat, jitter)
 
 def availability_filter_candidates(candidates):
@@ -906,6 +1198,7 @@ def measure_bandwidth_curl(node_str):
         "-w", "%{size_download} %{time_starttransfer} %{time_total}",
         "-L",
         "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "--http2",
         "--resolve", f"speed.cloudflare.com:{port}:{ip}",
         "--connect-timeout", str(BANDWIDTH_CONNECT_TIMEOUT),
         "--max-time", str(BANDWIDTH_TIMEOUT),
@@ -984,7 +1277,6 @@ def batch_update_cloudflare_dns(ip_list, ip_info=None, full_bw_results=None, tar
         print(f"不支持的 DNS_RECORD_TYPE: {record_type}，已跳过 DNS 更新。")
         return
 
-    # ========== 新增：并发查询风险等级 ==========
     risk_map = {}
     if DNS_IP_RISK_FILTER_ENABLED and full_bw_results:
         ip_set = set()
@@ -1003,7 +1295,6 @@ def batch_update_cloudflare_dns(ip_list, ip_info=None, full_bw_results=None, tar
                     except Exception:
                         risk_map[ip] = "未知"
             print("风险等级查询完成。")
-    # ==========================================
 
     if full_bw_results and ip_info:
         blocked_set = set()
@@ -1030,7 +1321,7 @@ def batch_update_cloudflare_dns(ip_list, ip_info=None, full_bw_results=None, tar
                     continue
 
             if blocked_set and '#' in node_str:
-                country = node_str.split('#')[-1].upper()
+                country = node_str.split('#')[-1].split()[0].upper()
                 if country in blocked_set:
                     filtered_by_country += 1
                     continue
@@ -1040,7 +1331,6 @@ def batch_update_cloudflare_dns(ip_list, ip_info=None, full_bw_results=None, tar
                 risk_fallback_node_list.append(node_str)
 
             if DNS_IP_RISK_FILTER_ENABLED:
-                # 从并发查询的映射中获取，不再串行等待
                 risk_level = risk_map.get(pure_ip, "未知")
                 max_level = DNS_IP_RISK_MAX_LEVEL
                 if risk_level == "未知" or RISK_LEVEL_ORDER.get(risk_level, 99) > RISK_LEVEL_ORDER.get(max_level, 2):
@@ -1302,7 +1592,6 @@ def write_ip_txt(final_nodes, output_file,
                 f.write(line + "\n")
         for node in final_nodes:
             line = node
-            # 按打印顺序：速度 -> HTTP延迟 -> HTTP抖动 -> TCP延迟
             if IP_TXT_SHOW_BANDWIDTH and speed_map and node in speed_map:
                 line += f" {speed_map[node]:.2f} Mbps"
             if IP_TXT_SHOW_HTTP_LATENCY and http_latency_map and node in http_latency_map:
@@ -1350,6 +1639,10 @@ def main():
                     nodes.append(n)
     print(f"合并后总计 {len(nodes)} 个节点。")
 
+    token_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), IP_CALIBRATION_TOKEN_FILE)
+    cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), IP_CALIBRATION_CACHE_FILE)
+    calibrate_regions(nodes, token_file, cache_file)
+
     if PRE_FILTER_PORT_ENABLED:
         before = len(nodes)
         nodes = [n for n in nodes if n.split(':')[1].split('#')[0] in PRE_FILTER_PORTS]
@@ -1363,7 +1656,7 @@ def main():
     if PRE_FILTER_BLOCKED_ENABLED and PRE_FILTER_BLOCKED_COUNTRIES:
         before = len(nodes)
         blocked_set = set(PRE_FILTER_BLOCKED_COUNTRIES)
-        nodes = [n for n in nodes if n.split('#')[-1].upper() not in blocked_set]
+        nodes = [n for n in nodes if n.split('#')[-1].split()[0].upper() not in blocked_set]
         after = len(nodes)
         print(f"前置黑名单过滤：{before} -> {after} 个节点（已屏蔽：{', '.join(sorted(blocked_set))}）")
         if not nodes:
@@ -1380,7 +1673,7 @@ def main():
         filtered_nodes = []
         for node in nodes:
             parts = node.split('#')
-            if len(parts) == 2 and parts[1].upper() in allowed_set:
+            if len(parts) == 2 and parts[1].split()[0].upper() in allowed_set:
                 filtered_nodes.append(node)
         nodes = filtered_nodes
         after = len(nodes)

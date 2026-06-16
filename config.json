@@ -19,7 +19,7 @@
     "MIN_SUCCESS_RATE": 1.0,
     "_comment_MIN_SUCCESS_RATE": "TCP 最低成功率阈值（0.0~1.0），低于此值的节点直接淘汰",
 
-    "TCP_LATENCY_WEIGHT": 1.0,
+    "TCP_LATENCY_WEIGHT": 0.0,
     "_comment_TCP_LATENCY_WEIGHT": "TCP延迟在综合排序中的权重（越大越排斥高TCP延迟）",
 
     "TIMEOUT": 2.0,
@@ -105,6 +105,17 @@
     "FETCH_CONNECT_TIMEOUT": 3,
     "_comment_FETCH_CONNECT_TIMEOUT": "获取节点列表连接超时（秒）",
 
+    "IP_CALIBRATION_ENABLED": false,
+    "_comment_IP_CALIBRATION_ENABLED": "是否启用 IP 地区校准（true=启用，false=禁用）",
+    "IP_CALIBRATION_CONCURRENCY": 300,
+    "_comment_IP_CALIBRATION_CONCURRENCY": "地区校准的并发查询数（根据 token 数量调整）",
+    "IP_CALIBRATION_MIN_INTERVAL": 0.1,
+    "_comment_IP_CALIBRATION_MIN_INTERVAL": "地区校准的最小请求间隔（秒）",
+    "IP_CALIBRATION_TOKEN_FILE": "valid_tokens.txt",
+    "_comment_IP_CALIBRATION_TOKEN_FILE": "地区校准的 token 文件名（位于脚本同目录）",
+    "IP_CALIBRATION_CACHE_FILE": "ipinfo_cache.txt",
+    "_comment_IP_CALIBRATION_CACHE_FILE": "地区校准的缓存文件名（位于脚本同目录）",
+
     "OUTPUT_FILE": "ip.txt",
     "_comment_OUTPUT_FILE": "最终结果保存的文件名",
 
@@ -171,10 +182,10 @@
     "HTTP_TEST_METHOD": "HEAD",
     "_comment_HTTP_TEST_METHOD": "HTTP 请求方法（GET 或 HEAD）",
 
-    "HTTP_LATENCY_WEIGHT": 1.0,
+    "HTTP_LATENCY_WEIGHT": 3.0,
     "_comment_HTTP_LATENCY_WEIGHT": "HTTP延迟在综合排序中的权重（越大越排斥高HTTP延迟）",
 
-    "JITTER_WEIGHT": 1.0,
+    "JITTER_WEIGHT": 3.0,
     "_comment_JITTER_WEIGHT": "HTTP延迟抖动（标准差）在综合排序中的权重（越大越排斥延迟波动大的节点）",
 
     "HTTP_JITTER_SAMPLES": 3,
@@ -223,7 +234,7 @@
     "BANDWIDTH_CONNECT_TIMEOUT": 3,
     "_comment_BANDWIDTH_CONNECT_TIMEOUT": "curl 测速连接超时（秒）",
 
-    "SPEED_WEIGHT": 1.0,
+    "SPEED_WEIGHT": 3.0,
     "_comment_SPEED_WEIGHT": "带宽在综合排序中的权重（越大越看重带宽）",
 
     "MAX_WORKERS": 300,

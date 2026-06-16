@@ -1,5 +1,3 @@
----
-
 # Cloudflare IP 优选工具
 
 [![GitHub stars](https://img.shields.io/github/stars/xinyitang3/cfnb?style=social)](https://github.com/xinyitang3/cfnb/stargazers)
@@ -47,6 +45,7 @@
 | 🚫 **DNS 黑名单** | DNS 更新时剔除指定国家节点（**仅作用于 DNS 更新环节**） |
 | 🛡️ **IPv6 落地过滤** | 过滤落地仅 IPv6 的节点，保留 IPv4/双栈节点（**仅作用于 DNS 更新环节**） |
 | 🔍 **IP 风险等级过滤** | 仅允许低风险节点，高危自动回退（**仅作用于 DNS 更新环节**） |
+| 🗺️ **IP 地区校准** | 基于 ipinfo.io 异步并发查询，自动校正节点国家代码，结果缓存复用 |
 | 🔒 **强制直连模式** | 可配置开关，一键清除系统代理，确保所有测试流量走直连 |
 | ☁️ **Cloudflare DNS 更新** | 原子批量替换同名 A/TXT 记录 |
 | 📬 **微信实时通知** | 集成 WxPusher，异常/结果推送 |
@@ -72,6 +71,7 @@
 | `ip.txt` | 最终优选节点列表（每次运行覆盖） |
 | `update_fork.ps1` | Windows 仓库修复脚本（解决 fork 后冲突/认证） |
 | `update_fork.sh` | Linux 仓库修复脚本（解决 fork 后冲突/认证） |
+| `valid_tokens.txt` | ipinfo.io API Token 列表（每行一个，用于 IP 地区校准） |
 
 ---
 
@@ -82,7 +82,7 @@
   - **Python 3.7+**
   - **Git**
   - **curl**（需在系统 PATH 中可用）
-- **Python 依赖**：`requests` 库
+- **Python 依赖**：`requests`, `aiohttp`, `brotlicffi`
 
 ---
 
@@ -101,7 +101,7 @@
 2. **配置各项令牌（见下一节）**  
    根据需求获取并填写 GitHub Token、Cloudflare API Token 和 WxPusher 凭证。
 
-> 💡 部署脚本会自动安装依赖、创建 `.gitignore` 并配置定时任务（每 5 分钟整点运行）。
+> 💡 部署脚本会自动安装 `requests`、`aiohttp`、`brotlicffi` 三个 Python 依赖、创建 `.gitignore` 并配置定时任务（每 5 分钟整点运行）。
 
 ---
 
@@ -176,7 +176,7 @@ python3 main.py
 2. 安装 [Git](https://git-scm.com/download/win) 和 [curl](https://curl.se/windows/)（curl 需加入 PATH）。
 3. 在项目目录打开命令提示符，安装依赖：
    ```cmd
-   pip install requests
+   pip install requests aiohttp brotlicffi
    ```
 4. （可选）手动创建计划任务：
    - 按 `Win + R`，输入 `taskschd.msc` 打开任务计划程序。
@@ -195,7 +195,7 @@ python3 main.py
    ```
 2. 安装 Python 依赖：
    ```bash
-   pip3 install requests
+   pip3 install requests aiohttp brotlicffi
    ```
 3. 赋予推送脚本执行权限（如果需要）：
    ```bash
@@ -271,7 +271,7 @@ python3 main.py
 | :--- | :--- | :--- | :--- |
 | `TCP_PROBES` | `int` | `1` | 每个节点 TCP 测试次数 |
 | `MIN_SUCCESS_RATE` | `float` | `1.0` | 最低成功率阈值（0.0~1.0） |
-| `TCP_LATENCY_WEIGHT` | `float` | `1.0` | TCP延迟在综合排序中的权重（越大越排斥高TCP延迟） |
+| `TCP_LATENCY_WEIGHT` | `float` | `0.0` | TCP延迟在综合排序中的权重（越大越排斥高TCP延迟） |
 | `TIMEOUT` | `float` | `2.0` | 单次 TCP 连接超时（秒） |
 | `SOCKET_DEFAULT_TIMEOUT` | `int` | `3` | 全局 Socket 默认超时（秒），防止永久阻塞 |
 | `PROGRESS_PRINT_INTERVAL` | `float` | `1` | 进度打印刷新间隔（秒），避免频繁 I/O |
@@ -283,10 +283,10 @@ python3 main.py
 
 | 参数 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `HTTP_LATENCY_WEIGHT` | `float` | `1.0` | HTTP延迟在综合排序中的权重（越大越排斥高HTTP延迟） |
-| `JITTER_WEIGHT` | `float` | `1.0` | HTTP延迟抖动（标准差）在综合排序中的权重（越大越排斥延迟波动大的节点） |
+| `HTTP_LATENCY_WEIGHT` | `float` | `3.0` | HTTP延迟在综合排序中的权重（越大越排斥高HTTP延迟） |
+| `JITTER_WEIGHT` | `float` | `3.0` | HTTP延迟抖动（标准差）在综合排序中的权重（越大越排斥延迟波动大的节点） |
 | `HTTP_JITTER_SAMPLES` | `int` | `3` | HTTP延迟抖动测试次数（至少3次，建议3~5次，越大越准但越慢） |
-| `SPEED_WEIGHT` | `float` | `1.0` | 带宽在综合排序中的权重（越大越看重带宽） |
+| `SPEED_WEIGHT` | `float` | `3.0` | 带宽在综合排序中的权重（越大越看重带宽） |
 
 ### 前置过滤参数（TCP 测试前生效）
 
@@ -370,6 +370,20 @@ python3 main.py
 | `OUTPUT_FILE` | `string` | `"ip.txt"` | 最终结果保存文件名 |
 | `ENABLE_LOGGING` | `boolean` | `false` | 是否启用运行日志（每次运行覆盖 LOG_FILE） |
 | `LOG_FILE` | `string` | `"cfnb.log"` | 运行日志文件名（仅在启用日志时生效） |
+
+### IP 地区校准参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `IP_CALIBRATION_ENABLED` | `boolean` | `false` | 是否启用 IP 地区校准（基于 ipinfo.io） |
+| `IP_CALIBRATION_CONCURRENCY` | `int` | `300` | 地区校准的异步并发数 |
+| `IP_CALIBRATION_MIN_INTERVAL` | `float` | `0.1` | 请求最小间隔（秒） |
+| `IP_CALIBRATION_TOKEN_FILE` | `string` | `"valid_tokens.txt"` | ipinfo.io Token 文件名 |
+| `IP_CALIBRATION_CACHE_FILE` | `string` | `"ipinfo_cache.txt"` | 校准结果缓存文件名 |
+
+> 💡 校准结果会实时写入缓存文件，程序结束后自动按 IP 地址排序，下次运行可复用。  
+> Token 文件每行一个 ipinfo.io 的 API Token，可在 [ipinfo.io](https://ipinfo.io/) 注册免费获取（每月 5 万次）。  
+> 程序会自动校验 Token 有效性并显示进度，当所有 Token 均触发速率限制时，会通过微信通知。
 
 <details>
 <summary>🔧 高级参数（可用性 /HTTP / 带宽 / 并发 / 重试 / 广告/ 输出）</summary>
@@ -752,7 +766,7 @@ git branch -M $(git remote show origin | grep "HEAD branch" | cut -d " " -f5) 2>
 > 各阶段对应域名见上方“涉及域名”列表。
 
 **涉及域名：**  
-`cm.edu.kg` · `090227.xyz` · `cloudflare.com` · `zjiecode.com` · `pages.dev` · `ipapi.is` · `github.com` · `githubusercontent.com`
+`cm.edu.kg` · `ipinfo.io` · `090227.xyz` · `cloudflare.com` · `zjiecode.com` · `pages.dev` · `ipapi.is` · `github.com` · `githubusercontent.com`
 
 **建议：**  
 1. 检查本机能否直连上述域名 → 能通设 `DIRECT`，不通设 `PROXY`  
@@ -765,7 +779,7 @@ git branch -M $(git remote show origin | grep "HEAD branch" | cut -d " " -f5) 2>
 <summary>🔌 依赖与安装</summary>
 
 1. **提示 `ModuleNotFoundError: No module named 'requests'`**  
-   请执行 `pip install requests` (Windows) 或 `pip3 install requests` (Linux)。
+   请执行 `pip install requests aiohttp brotlicffi` (Windows) 或 `pip3 install requests aiohttp brotlicffi` (Linux)。
 
 2. **带宽测速被跳过**  
    请确保系统已安装 `curl` 且位于 PATH 环境变量中。
@@ -831,9 +845,26 @@ git branch -M $(git remote show origin | grep "HEAD branch" | cut -d " " -f5) 2>
 </details>
 
 <details>
+<summary>🗺️ IP 地区校准</summary>
+
+15. **IP 地区校准是做什么的？**  
+    - 程序会通过 ipinfo.io 查询每个节点 IP 的真实国家代码、城市和 ISP，并缓存到 `ipinfo_cache.txt`。
+    - 校准后节点标签只保留国家代码（如 `#HK`），不影响原有筛选逻辑。
+
+16. **校准速度很慢怎么办？**  
+    - 可适当降低 `IP_CALIBRATION_CONCURRENCY`（如 100），或增加 `IP_CALIBRATION_MIN_INTERVAL`（如 0.15）。
+    - 若不需要校准，将 `IP_CALIBRATION_ENABLED` 设为 `false` 即可跳过。
+
+17. **收到"token可能已耗尽"的微信通知？**  
+    - 只有所有 Token 都触发 ipinfo.io 的速率限制（429）时才会发送此通知，单个 Token 被限速会自动切换，不影响查询。
+    - 可在 [ipinfo.io](https://ipinfo.io/) 申请更多免费 Token 放入 `valid_tokens.txt`。
+
+</details>
+
+<details>
 <summary>🔒 隐私与其他</summary>
 
-15. **隐私保护**  
+18. **隐私保护**  
    自动生成的 `.gitignore` 文件会忽略 `config.json`、`git_sync.ps1` 和 `git_sync.sh`，防止敏感信息被提交到公开仓库。
 
 </details>
@@ -844,10 +875,9 @@ git branch -M $(git remote show origin | grep "HEAD branch" | cut -d " " -f5) 2>
 
 - 节点数据源 & 检测 API：[cmliussss](https://github.com/cmliussss)
 - IP 风险检测 API：[ipapi.is](https://ipapi.is/)
+- IP 地区校准：[ipinfo.io](https://ipinfo.io/)
 - 微信通知服务：[WxPusher](https://wxpusher.zjiecode.com/)
 
 ---
 
 **许可证**：本项目采用 [MIT License](https://opensource.org/licenses/MIT) 开源。
-
----
