@@ -22,7 +22,9 @@ import ipaddress
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib3.exceptions import InsecureRequestWarning
+import warnings
 
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 # 修复 Windows 下 ProactorEventLoop 残留任务报警
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
