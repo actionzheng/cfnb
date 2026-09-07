@@ -1518,8 +1518,9 @@ def batch_update_cloudflare_dns(ip_list, ip_info=None, exit_details=None, full_b
         print(line)
 
     headers = {
-        "Authorization": f"Bearer2f} ms"
-        print(line)
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
 
     headers = {
         "Authorization": f"Bearer {CF_API_TOKEN}",
