@@ -1640,4 +1640,4 @@ def sync_to_github():
             pass
 
     for attempt in range(1, GITHUB_SYNC_MAX_RETRIES + 1):
-        print(f"\n正在同步
+        print(f"\n正在同步到 GitHub (尝试 {attempt}/{GITHUB_SYNC_MAX_RETRIES})...")
