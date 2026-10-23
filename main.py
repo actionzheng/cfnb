@@ -19,6 +19,7 @@ import json
 import asyncio
 import aiohttp
 import ipaddress
+import warnings
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib3.exceptions import InsecureRequestWarning
@@ -29,23 +30,17 @@ if sys.platform == 'win32':
 
 # 禁用 SSL 警告 (用于 HTTP 检测)
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
-# ===== 全局禁用 SSL 验证（解决证书问题）=====
-import functools
-original_get = requests.get
-original_post = requests.post
+# ===== 全局禁用 SSL 验证（所有 requests 方法 + Session 实例）=====
+_original_session_request = requests.Session.request
 
-def new_get(url, *args, **kwargs):
-    kwargs.setdefault('verify', False)
-    return original_get(url, *args, **kwargs)
+def _new_session_request(self, method, url, *args, **kwargs):
+    kwargs.setdefault("verify", False)
+    return _original_session_request(self, method, url, *args, **kwargs)
 
-def new_post(url, *args, **kwargs):
-    kwargs.setdefault('verify', False)
-    return original_post(url, *args, **kwargs)
-
-requests.get = new_get
-requests.post = new_post
-# ===========================================
+requests.Session.request = _new_session_request
+# ================================================================
 
 # ==================== 预编译正则 ====================
 NODE_PATTERN = re.compile(r"^(\d+\.\d+\.\d+\.\d+):(\d+)#(.+)$")
@@ -740,7 +735,7 @@ def fetch_additional_source(url):
     for attempt in range(1, FETCH_MAX_RETRIES + 1):
         try:
             print(f"正在请求数据源 {url} (尝试 {attempt}/{FETCH_MAX_RETRIES}) ...")
-            headers = {"Accept-Encoding": "gzip, deflate, br, zstd"}
+            headers = {"Accept-Encoding": "gzip, deflate, br"}
             resp = requests.get(url, timeout=(FETCH_CONNECT_TIMEOUT, FETCH_TIMEOUT), headers=headers)
             resp.raise_for_status()
             nodes = parse_adaptive(resp.text)
@@ -773,7 +768,10 @@ class IpInfoAsync:
         self.rate_locks = [asyncio.Lock() for _ in range(self.n_tokens)]
 
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession(trust_env=self.trust_env)
+        self.session = aiohttp.ClientSession(
+            trust_env=self.trust_env,
+            connector=aiohttp.TCPConnector(ssl=False)
+        )
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -898,7 +896,10 @@ def sort_cache_file(cache_file):
 async def validate_tokens(token_list, concurrency, min_interval, trust_env):
     valid = []
     sem = asyncio.Semaphore(concurrency)
-    async with aiohttp.ClientSession(trust_env=trust_env) as session:
+    async with aiohttp.ClientSession(
+        trust_env=trust_env,
+        connector=aiohttp.TCPConnector(ssl=False)
+    ) as session:
         async def check(token):
             url = f"https://ipinfo.io/json?token={token}"
             try:
@@ -1127,7 +1128,10 @@ def check_http_server(node_str, timeout, max_retries, retry_delay, method, conne
     ip, port = m.group(1), m.group(2)
     url = f"http://{ip}:{port}/cdn-cgi/trace"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Upgrade-Insecure-Requests": "1",
     }
 
     test_rounds = max(3, HTTP_JITTER_SAMPLES)
@@ -1137,7 +1141,6 @@ def check_http_server(node_str, timeout, max_retries, retry_delay, method, conne
             start = time.time()
             request_kwargs = {
                 "timeout": (connect_timeout, timeout),
-                "verify": False,
                 "allow_redirects": False,
                 "headers": headers,
                 "proxies": {"http": None, "https": None}
@@ -1316,13 +1319,16 @@ def measure_bandwidth_curl(node_str):
         "curl", "-s", "-o", null_device,
         "-w", "%{size_download} %{time_starttransfer} %{time_total}",
         "-L",
-        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+        "-H", "Accept: */*",
+        "-H", "Accept-Language: zh-CN,zh;q=0.9",
+        "-H", "Accept-Encoding: identity",
         "--http2",
         "--noproxy", "*",
         "--resolve", f"speed.cloudflare.com:{port}:{ip}",
         "--connect-timeout", str(BANDWIDTH_CONNECT_TIMEOUT),
         "--max-time", str(BANDWIDTH_TIMEOUT),
-    ] + insecure_flag + [url]   # 动态添加 --insecure（如果是 https）
+    ] + insecure_flag + [url]
 
     try:
         result = subprocess.run(curl_cmd, capture_output=True, text=True,
